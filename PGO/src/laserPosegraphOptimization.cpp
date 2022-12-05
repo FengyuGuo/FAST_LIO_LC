@@ -16,6 +16,7 @@
 #include <vector>
 #include <mutex>
 #include <queue>
+#include <deque>
 #include <thread>
 #include <iostream>
 #include <string>
@@ -46,8 +47,10 @@
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <geometry_msgs/PoseStamped.h>
+#include "cv_bridge/cv_bridge.h"
 
 #include <Eigen/Dense>
+#include <Eigen/Core>
 
 #include <ceres/ceres.h>
 
@@ -91,10 +94,17 @@ Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init pose is zero
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
 std::queue<sensor_msgs::NavSatFix::ConstPtr> gpsBuf;
+std::deque<sensor_msgs::ImageConstPtr> camBuf;
+Eigen::Matrix4d T_LtoC;
+double fx, fy, cx, cy;
 std::queue<std::pair<int, int> > scLoopICPBuf;
 
 std::mutex mBuf;
 std::mutex mKF;
+std::mutex mCam;
+
+std::string cameraTopic;
+std::string extrinsicPath;
 
 double timeLaserOdometry = 0.0;
 double timeLaser = 0.0;
@@ -248,6 +258,18 @@ void gpsHandler(const sensor_msgs::NavSatFix::ConstPtr &_gps)
         mBuf.unlock();
     }
 } // gpsHandler
+
+void camHandler(const sensor_msgs::ImageConstPtr& img)
+{
+    mCam.lock();
+    camBuf.push_back(img);
+
+    while(camBuf.size()>20)
+    {
+        camBuf.pop_front();
+    }
+    mCam.unlock();
+}
 
 void initNoises( void )
 {
@@ -604,6 +626,7 @@ void process_pg()
             laserCloudFullRes->clear();
             pcl::PointCloud<PointType>::Ptr thisKeyFrame(new pcl::PointCloud<PointType>());
             pcl::fromROSMsg(*fullResBuf.front(), *thisKeyFrame);
+            double pcdTime=fullResBuf.front()->header.stamp.toSec();
             fullResBuf.pop();
 
             Pose6D pose_curr = getOdom(odometryBuf.front());
@@ -729,6 +752,95 @@ void process_pg()
 
             // save utility 
             std::string curr_node_idx_str = padZeros(curr_node_idx);
+            /**
+             * project the point to camera and get the color of the point
+             */
+            pcl::PointCloud<pcl::PointXYZRGB> colorCloud;
+            mCam.lock();
+            if(!camBuf.empty())
+            {
+                size_t corespondingImage=100;
+                for(size_t i = camBuf.size()-1; i>=0; i--)
+                {
+                    if(camBuf[i]->header.stamp.toSec() < pcdTime)
+                    {
+                        corespondingImage=i;
+                        break;
+                    }
+                }
+                bool imageFound=false;
+                if(corespondingImage != 100)
+                {
+                    imageFound = true;
+                    // ROS_INFO("image found!");
+                }
+                else
+                {
+                    ROS_INFO("no image found!");
+                }
+                cv_bridge::CvImageConstPtr imgPtr;
+                if(imageFound)
+                {
+                    imgPtr = cv_bridge::toCvCopy(camBuf[corespondingImage]);
+                }
+                mCam.unlock();
+
+                if(imageFound)
+                {
+                    cv::Mat img=imgPtr->image;
+                    // ROS_INFO("try to find color of point");
+                    for(size_t i = 0; i < thisKeyFrame->size(); i++)
+                    {
+                        pcl::PointXYZRGB pt_c;
+                        pt_c.x=thisKeyFrame->at(i).x;
+                        pt_c.y=thisKeyFrame->at(i).y;
+                        pt_c.z=thisKeyFrame->at(i).z;
+                        Eigen::Vector4d pt;
+                        pt<<thisKeyFrame->at(i).x, thisKeyFrame->at(i).y, thisKeyFrame->at(i).z, 1;
+                        Eigen::Vector4d pt_inC = T_LtoC * pt;
+                        if(pt_inC(2) == 0)
+                        {
+                            continue;
+                        }
+                        Eigen::Vector4d pt_inI = pt_inC / pt_inC(2);
+                        int u=pt_inI(0)*fx+cx;
+                        int v=pt_inI(1)*fy+cy;
+                        // ROS_INFO("u: %d, v: %d", u, v);
+                        if(u > img.size().width-1 || v > img.size().height-1)
+                        {
+                            continue;
+                            pt_c.r = 128;
+                            pt_c.g = 128;
+                            pt_c.b = 128;
+                            colorCloud.push_back(pt_c);
+                            continue;
+                        }
+                        //cv::CV_Assert(img.depth() == cv::CV_8U);
+                        const int channels = img.channels();
+                        
+                        switch(channels)
+                        {
+                        case 1:
+                            {
+                                pt_c.r=img.at<uchar>(v,u);
+                                pt_c.g=pt_c.r;
+                                pt_c.b=pt_c.r;
+                                break;
+                            }
+                        case 3:
+                            {
+                            cv::Mat_<cv::Vec3b> _I = img;
+                            pt_c.r=_I(v,u)[0];
+                            pt_c.g=_I(v,u)[1];
+                            pt_c.b=_I(v,u)[2];
+                            break;
+                            }
+                        }
+                        colorCloud.push_back(pt_c);
+                    }
+                    pcl::io::savePCDFileBinary(pgScansDirectory + curr_node_idx_str + "_c.pcd", colorCloud); // scan
+                }
+            }
             pcl::io::savePCDFileBinary(pgScansDirectory + curr_node_idx_str + ".pcd", *thisKeyFrame); // scan 
             pgTimeSaveStream << timeLaser << std::endl; // path 
         }
@@ -960,6 +1072,7 @@ void process_isam(void)
 
             saveOptimizedVerticesKITTIformat(isamCurrentEstimate, pgKITTIformat); // pose
             saveOdometryVerticesKITTIformat(odomKITTIformat); // pose
+            ROS_INFO("pose saved!");
         }
     }
 }
@@ -1032,6 +1145,45 @@ int main(int argc, char **argv)
 	nh.param<int>("graphUpdateTimes", graphUpdateTimes, 2);  
 	nh.param<double>("loopFitnessScoreThreshold", loopFitnessScoreThreshold, 0.3);  
 
+    nh.param<std::string>("camera_topic", cameraTopic, "/camera/color/image_raw");
+    std::string extrinsicPath;
+    cv::Mat matExtrinsic;
+    nh.param<std::string>("camera_extrinsics", extrinsicPath, "/home/guo/fast_lio_lc_ws/src/livox_camera_calib/config/config_indoor.yaml");
+    cv::FileStorage fSettings(extrinsicPath, cv::FileStorage::READ);
+    if (!fSettings.isOpened()) {
+        std::cerr << "Failed to open settings file at: " << extrinsicPath
+                << std::endl;
+        exit(-1);
+    } else {
+        ROS_INFO("Sucessfully load camera extrinsic config file");
+    }
+    fSettings["ExtrinsicMat"] >> matExtrinsic;
+    T_LtoC << matExtrinsic.at<double>(0, 0),
+        matExtrinsic.at<double>(0, 1), matExtrinsic.at<double>(0, 2), matExtrinsic.at<double>(0, 3),
+        matExtrinsic.at<double>(1, 0), matExtrinsic.at<double>(1, 1),
+        matExtrinsic.at<double>(1, 2), matExtrinsic.at<double>(1, 3), matExtrinsic.at<double>(2, 0),
+        matExtrinsic.at<double>(2, 1), matExtrinsic.at<double>(2, 2), matExtrinsic.at<double>(2, 3), 0, 0, 0, 1;
+    std::cout<<"T_LtoC: " << T_LtoC << std::endl;
+    std::vector<double> camera_matrix;
+    nh.param<std::vector<double>>("camera/camera_matrix", camera_matrix,
+                           std::vector<double>());
+    if(camera_matrix.empty())
+    {
+        std::cerr << "can not load camera matrix!" << std::endl;
+        exit(-1);
+    }
+    else
+    {
+        fx=camera_matrix[0];
+        cx=camera_matrix[2];
+        fy=camera_matrix[4];
+        cy=camera_matrix[5];
+        std::cout << "load camera matrix: " << camera_matrix.size() << std::endl;
+        std::cout << "fy:" << fx << ", fy:" << fy << ", cx:" << cx << ", cy:" << cy <<std::endl;
+    }
+    
+
+
 	nh.param<double>("speedFactor", speedFactor, 1);  
     {
         nh.param<double>("loopClosureFrequency", loopClosureFrequency, 2);  
@@ -1067,6 +1219,7 @@ int main(int argc, char **argv)
 	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
 	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
 	ros::Subscriber subGPS = nh.subscribe<sensor_msgs::NavSatFix>("/gps/fix", 100, gpsHandler);
+    ros::Subscriber subCamera = nh.subscribe<sensor_msgs::Image>(cameraTopic, 100, camHandler);
 
 	pubOdomAftPGO = nh.advertise<nav_msgs::Odometry>("/aft_pgo_odom", 100);
 	pubOdomRepubVerifier = nh.advertise<nav_msgs::Odometry>("/repub_odom", 100);
